@@ -1,0 +1,64 @@
+# Environment files, including local overrides and copies
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+
+# Runtime state; never commit the SQLite database or its sidecars
+data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Credentials and private keys
+secrets/
+credentials/
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# Backups and local logs
+backups/
+backup/
+*.backup*
+*.bak
+*.old
+*.orig
+*.save
+*.dump
+*.sql
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+logs/
+*.log
+*.log.*
+
+# Python environments and generated files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
