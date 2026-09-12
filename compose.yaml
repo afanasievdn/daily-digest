@@ -1,0 +1,12 @@
+services:
+  daily-digest:
+    build: .
+    container_name: daily-digest
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    environment:
+      DATA_DIR: /data
+
