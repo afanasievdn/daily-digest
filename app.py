@@ -510,7 +510,7 @@ async def run_digest(application: Application, lookback_hours: int | None = None
                 OWNER_CHAT_ID,
                 format_post(post),
                 parse_mode=ParseMode.HTML,
-                disable_web_page_preview=False,
+                disable_web_page_preview=bool(post.media),
             )
             if message is not None:
                 sent_ids.append(message.message_id)
