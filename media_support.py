@@ -21,7 +21,10 @@ CSS_URL = re.compile(r"background-image\s*:\s*url\(\s*['\"]?([^'\")]+)", re.I)
 MAX_PHOTO_BYTES = 10 * 1024 * 1024
 MAX_VIDEO_BYTES = 45 * 1024 * 1024
 MAX_POST_BYTES = 90 * 1024 * 1024
-USER_AGENT = "Mozilla/5.0 (compatible; DailyDigest/1.0)"
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "Chrome/128.0 Safari/537.36"
+)
 
 
 @dataclass(frozen=True)
@@ -37,13 +40,17 @@ def _cdn_url(raw: str | None) -> str | None:
     raw = raw.strip()
     if raw.startswith("//"):
         raw = "https:" + raw
-    parts = urlsplit(raw)
+    try:
+        parts = urlsplit(raw)
+        port = parts.port
+    except ValueError:
+        return None
     host = (parts.hostname or "").lower()
     if (
         parts.scheme != "https"
         or parts.username is not None
         or parts.password is not None
-        or parts.port not in (None, 443)
+        or port not in (None, 443)
         or not (host.endswith(".telesco.pe") or host.endswith(".telegram-cdn.org"))
     ):
         return None
@@ -85,7 +92,7 @@ def download_media(item: MediaItem) -> bytes:
     maximum = MAX_VIDEO_BYTES if item.kind == "video" else MAX_PHOTO_BYTES
     with requests.get(
         item.url,
-        headers={"User-Agent": USER_AGENT},
+        headers={"User-Agent": USER_AGENT, "Referer": "https://t.me/"},
         timeout=(10, 35),
         stream=True,
         allow_redirects=False,
