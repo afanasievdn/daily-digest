@@ -123,7 +123,9 @@ async def _send_with_retry(callback):
             if attempt == 2:
                 LOG.warning("Media rate limit: %s", exc)
                 return None
-            await asyncio.sleep(min(float(exc.retry_after), 60) + 0.5)
+            wait = exc.retry_after
+            seconds = wait.total_seconds() if hasattr(wait, "total_seconds") else float(wait)
+            await asyncio.sleep(min(seconds, 60) + 0.5)
         except (NetworkError, TimedOut) as exc:
             if attempt == 2:
                 LOG.warning("Media delivery failed after retries: %s", exc)
