@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
+from media_support import MediaItem, deliver_media, extract_media
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, TimedOut
@@ -57,6 +58,7 @@ class Post:
     message_id: int
     published_at: datetime
     text: str
+    media: tuple[MediaItem, ...] = ()
 
     @property
     def url(self) -> str:
@@ -302,7 +304,9 @@ def scrape_channel(username: str, since: datetime, max_pages: int = 12) -> list[
             page_ids.append(message_id)
             page_dates.append(published)
             if published >= since:
-                posts[message_id] = Post(username, message_id, published, text)
+                posts[message_id] = Post(
+                    username, message_id, published, text, extract_media(node)
+                )
 
         if not page_ids or not page_dates or min(page_dates) < since:
             break
@@ -510,6 +514,13 @@ async def run_digest(application: Application, lookback_hours: int | None = None
             )
             if message is not None:
                 sent_ids.append(message.message_id)
+                if post.media:
+                    media_ids = await deliver_media(
+                        application.bot, OWNER_CHAT_ID, post.media
+                    )
+                    for media_id in media_ids:
+                        remember_chat_message(OWNER_CHAT_ID, media_id)
+                    sent_ids.extend(media_ids)
 
         keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton("🚫 Отписаться", callback_data=f"unsub:{username}")]]
