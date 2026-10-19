@@ -510,7 +510,9 @@ async def run_digest(application: Application, lookback_hours: int | None = None
                 OWNER_CHAT_ID,
                 format_post(post),
                 parse_mode=ParseMode.HTML,
-                disable_web_page_preview=bool(post.media),
+                # A Telegram link preview looks like an image but opens the source
+                # channel on mobile. Real media is delivered below as an attachment.
+                disable_web_page_preview=True,
             )
             if message is not None:
                 sent_ids.append(message.message_id)
