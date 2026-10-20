@@ -51,3 +51,27 @@ jobs:
               except requests.RequestException as e:
                   print(label, type(e).__name__, flush=True)
           PY
+      - name: Inspect player attributes on real post
+        run: |
+          python - <<'PY'
+          import requests
+          from bs4 import BeautifulSoup
+          from urllib.parse import urlsplit
+          url = "https://t.me/world_playstation/55856"
+          r = requests.get(url, params={"embed":"1","single":"1"}, headers={"User-Agent":"Mozilla/5.0"}, timeout=20)
+          soup = BeautifulSoup(r.text, "html.parser")
+          player = soup.select_one(".tgme_widget_message_video_player")
+          print("http_status", r.status_code)
+          print("has_player", bool(player))
+          if player:
+              for tag in [player, *player.find_all(True)][:25]:
+                  safe=[]
+                  for name, value in tag.attrs.items():
+                      if name == "class": safe.append((name,value))
+                      elif name in ("href","src","data-src","data-video"): safe.append((name, "host:"+str(urlsplit(value).hostname) if isinstance(value,str) and urlsplit(value).hostname else "present"))
+                      else: safe.append((name,"present"))
+                  print("tag",tag.name,safe)
+          for key in ["mp4", ".m3u8", "og:video", "data-video", "video_url", "video_url", "video_id"]:
+              print("html_marker",key,r.text.lower().count(key.lower()))
+          print("meta_video_tags",[(e.get("property"),bool(e.get("content"))) for e in soup.select('meta[property*="video"]')])
+          PY
