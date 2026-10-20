@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
-from media_support import MediaItem, deliver_media, extract_media
+from media_support import MediaItem, deliver_media, extract_media, recover_embedded_videos
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, TimedOut
@@ -517,8 +517,16 @@ async def run_digest(application: Application, lookback_hours: int | None = None
             if message is not None:
                 sent_ids.append(message.message_id)
                 if post.media:
+                    # The channel feed may contain only a video thumbnail.
+                    # Check Telegram's public single-post HTML before sending media.
+                    media = await asyncio.to_thread(
+                        recover_embedded_videos,
+                        post.channel,
+                        post.message_id,
+                        post.media,
+                    )
                     media_ids = await deliver_media(
-                        application.bot, OWNER_CHAT_ID, post.media
+                        application.bot, OWNER_CHAT_ID, media
                     )
                     for media_id in media_ids:
                         remember_chat_message(OWNER_CHAT_ID, media_id)
