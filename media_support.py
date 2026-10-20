@@ -9,10 +9,11 @@ import logging
 import re
 from dataclasses import dataclass
 from io import BytesIO
+from urllib.parse import quote
 from urllib.parse import urlsplit
 
 import requests
-from bs4 import Tag
+from bs4 import BeautifulSoup, Tag
 from telegram import InputFile, InputMediaPhoto, InputMediaVideo
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 
@@ -75,8 +76,13 @@ def extract_media(node: Tag) -> tuple[MediaItem, ...]:
             url = _background_url(element)
             kind = "photo"
         else:
-            video = element.select_one("video.tgme_widget_message_video, video[src], video source[src]")
-            url = _cdn_url(video.get("src")) if video else None
+            url = None
+            for video in element.select(
+                "video[src], video[data-src], video source[src], video source[data-src]"
+            ):
+                url = _cdn_url(video.get("src") or video.get("data-src"))
+                if url:
+                    break
             kind = "video"
             if not url:
                 url = _background_url(element.select_one(".tgme_widget_message_video_thumb"))
@@ -85,6 +91,39 @@ def extract_media(node: Tag) -> tuple[MediaItem, ...]:
             items.append(MediaItem(kind, url))
             seen.add(url)
     return tuple(items)
+
+
+def recover_embedded_videos(
+    channel: str, message_id: int, items: tuple[MediaItem, ...]
+) -> tuple[MediaItem, ...]:
+    """Try Telegram's public single-post embed when the feed only exposes a video thumbnail.
+
+    This uses Telegram's public website, not a Telegram user client or account.
+    Original files are not guaranteed to appear in the public embed.
+    """
+    if not any(item.kind == "preview" for item in items):
+        return items
+    try:
+        response = requests.get(
+            f"https://t.me/{quote(channel, safe='')}/{message_id}",
+            params={"embed": "1", "single": "1"},
+            headers={"User-Agent": USER_AGENT},
+            timeout=(10, 20),
+            allow_redirects=False,
+        )
+        if response.status_code != 200:
+            return items
+        response.raise_for_status()
+        embedded = extract_media(BeautifulSoup(response.text, "html.parser"))
+    except (requests.RequestException, ValueError, OSError) as exc:
+        LOG.warning("Could not inspect public video embed: %s", exc)
+        return items
+
+    videos = iter(item for item in embedded if item.kind == "video")
+    return tuple(
+        next(videos, item) if item.kind == "preview" else item
+        for item in items
+    )
 
 
 def download_media(item: MediaItem) -> bytes:
@@ -152,6 +191,10 @@ async def deliver_media(bot, chat_id: int, items: tuple[MediaItem, ...]) -> list
     loaded: list[tuple[MediaItem, bytes]] = []
     used = 0
     for item in items:
+        # A thumbnail is not playable video; never send it as a fake photo.
+        if item.kind == "preview":
+            LOG.info("Video not exposed by Telegram public HTML; thumbnail skipped")
+            continue
         if len(loaded) >= 20:
             LOG.warning("Post has too many attachments; remaining items skipped")
             break
