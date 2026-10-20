@@ -22,3 +22,32 @@ jobs:
         run: python -m compileall -q app.py media_support.py tests
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
+      - name: Probe public Telegram video on PR runner
+        run: |
+          python - <<'PY'
+          import requests
+          from bs4 import BeautifulSoup
+          from urllib.parse import urlsplit
+          from media_support import extract_media, recover_embedded_videos
+          headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/128.0 Safari/537.36"}
+          for label, url, params in [
+              ("post", "https://t.me/world_playstation/55856", None),
+              ("post-embed", "https://t.me/world_playstation/55856", {"embed": "1", "single": "1"}),
+              ("channel-feed", "https://t.me/s/world_playstation", {"before": 55857}),
+          ]:
+              try:
+                  r = requests.get(url, headers=headers, params=params, timeout=(10, 20), allow_redirects=False)
+                  print(label, "HTTP", r.status_code, "length", len(r.content), flush=True)
+                  if r.status_code != 200:
+                      continue
+                  soup = BeautifulSoup(r.text, "html.parser")
+                  post = soup.select_one('div.tgme_widget_message[data-post="world_playstation/55856"]')
+                  node = post or soup
+                  kinds = extract_media(node)
+                  print(label, "has_post", bool(post), "video_players", len(node.select('.tgme_widget_message_video_player')), "video_tags", len(node.select('video')), "items", [(v.kind, urlsplit(v.url).hostname) for v in kinds], flush=True)
+                  if label == "channel-feed" and post:
+                      resolved = recover_embedded_videos("world_playstation", 55856, kinds)
+                      print("after recovery", [(v.kind, urlsplit(v.url).hostname) for v in resolved], flush=True)
+              except requests.RequestException as e:
+                  print(label, type(e).__name__, flush=True)
+          PY
