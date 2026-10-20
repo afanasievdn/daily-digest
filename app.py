@@ -583,6 +583,9 @@ async def post_init(application: Application) -> None:
         scheduled_digest,
         time=clock_time(DIGEST_HOUR, DIGEST_MINUTE, tzinfo=TZ),
         name="daily-digest",
+        # APScheduler otherwise treats even a few seconds of scheduler jitter as a missed run.
+        # Five minutes covers a delayed tick without sending an outdated digest much later.
+        job_kwargs={"misfire_grace_time": 300},
     )
     bot = await application.bot.get_me()
     LOG.info(
