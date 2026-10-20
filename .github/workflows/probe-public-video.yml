@@ -1,0 +1,54 @@
+name: Probe Telegram public video HTML
+
+on:
+  push:
+    branches: [fix/telegram-video-previews-20261020]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt
+      - name: Probe specific public video post (no Telegram account or secrets)
+        run: |
+          python - <<'PY'
+          import requests
+          from bs4 import BeautifulSoup
+          from urllib.parse import urlsplit
+          from media_support import extract_media, recover_embedded_videos
+
+          headers = {
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/128.0 Safari/537.36"
+          }
+          channel, mid = "world_playstation", 55856
+          urls = [
+              ("post", f"https://t.me/{channel}/{mid}", None),
+              ("post-embed", f"https://t.me/{channel}/{mid}", {"embed": "1", "single": "1"}),
+              ("channel-feed", f"https://t.me/s/{channel}", {"before": mid + 1}),
+          ]
+          for label, url, params in urls:
+              try:
+                  r = requests.get(url, params=params, headers=headers, timeout=(10, 25), allow_redirects=False)
+                  print(f"{label}: http={r.status_code}, content-type={r.headers.get('Content-Type', '')[:70]}, bytes={len(r.content)}")
+                  if r.status_code != 200:
+                      continue
+                  soup = BeautifulSoup(r.text, "html.parser")
+                  node = soup.select_one(f'div.tgme_widget_message[data-post="{channel}/{mid}"]')
+                  scope = node or soup
+                  candidates = extract_media(scope)
+                  print(f"{label}: target-post-present={bool(node)}, players={len(scope.select('.tgme_widget_message_video_player'))}, videos={len(scope.select('video'))}, extracted={[v.kind for v in candidates]}, hosts={[urlsplit(v.url).hostname for v in candidates]}")
+                  for el in scope.select('video,video source')[:3]:
+                      print(f"{label}: media-tag={el.name}, src={bool(el.get('src'))}, data-src={bool(el.get('data-src'))}, parent={el.parent.name if el.parent else 'none'}")
+                  if label == "channel-feed" and node:
+                      enhanced = recover_embedded_videos(channel, mid, candidates)
+                      print(f"{label}: after-recovery={[v.kind for v in enhanced]}")
+              except requests.RequestException as exc:
+                  print(f"{label}: error={type(exc).__name__}")
+          PY
