@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from bs4 import BeautifulSoup
 
-from media_support import MediaItem, _cdn_url, deliver_media, extract_media
+from media_support import MediaItem, _cdn_url, deliver_media, extract_media, recover_embedded_videos
 
 
 def read_media(markup):
@@ -47,6 +47,51 @@ class HtmlMediaTests(unittest.TestCase):
            </a>''')
         self.assertEqual(items, (MediaItem("preview", "https://cdn1.telesco.pe/thumbnail.jpg"),))
 
+    def test_video_source_and_lazy_source(self):
+        items = read_media('''
+           <a class="tgme_widget_message_video_player">
+             <video><source data-src="https://cdn1.telesco.pe/from_source.mp4"></video>
+           </a>''')
+        self.assertEqual(items, (
+            MediaItem("video", "https://cdn1.telesco.pe/from_source.mp4"),
+        ))
+
+    def test_recover_video_from_public_embed(self):
+        response = SimpleNamespace(
+            status_code=200,
+            text=('''<a class="tgme_widget_message_video_player">
+                     <video src="https://cdn1.telesco.pe/original.mp4"></video>
+                   </a>'''),
+            raise_for_status=lambda: None,
+        )
+        original = (MediaItem("preview", "https://cdn1.telesco.pe/thumb.jpg"),)
+        with patch("media_support.requests.get", return_value=response) as request:
+            recovered = recover_embedded_videos("public_channel", 123, original)
+        self.assertEqual(recovered, (
+            MediaItem("video", "https://cdn1.telesco.pe/original.mp4"),
+        ))
+        self.assertEqual(request.call_args.kwargs["params"], {
+            "embed": "1", "single": "1"
+        })
+        self.assertFalse(request.call_args.kwargs["allow_redirects"])
+
+    def test_no_video_in_public_embed_keeps_marker(self):
+        response = SimpleNamespace(
+            status_code=200,
+            text="<div>Video unavailable</div>",
+            raise_for_status=lambda: None,
+        )
+        original = (MediaItem("preview", "https://cdn1.telesco.pe/thumb.jpg"),)
+        with patch("media_support.requests.get", return_value=response):
+            self.assertEqual(
+                recover_embedded_videos("public_channel", 123, original),
+                original,
+            )
+
+    def test_video_without_source_or_thumbnail_still_reported(self):
+        items = read_media('<a class="tgme_widget_message_video_player"></a>')
+        self.assertEqual(items, (MediaItem("preview", ""),))
+
     def test_missing_media(self):
         self.assertEqual(read_media("<p>plain text</p>"), ())
 
@@ -70,8 +115,70 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         with patch("media_support.download_media", return_value=b"image bytes"):
             ids = await deliver_media(bot, 123, (
                 MediaItem("photo", "https://cdn1.telesco.pe/1.jpg"),))
-        self.assertEqual(ids, [11])
+        self.assertEqual(ids.message_ids, [11])
+        self.assertEqual(ids.unavailable_videos, 0)
         self.assertEqual(bot.photo["chat_id"], 123)
+
+    async def test_video_thumbnail_never_sent_as_photo(self):
+        class Bot:
+            async def send_photo(self, **kwargs):
+                raise AssertionError("Video preview must not be sent as photo")
+        with patch("media_support.download_media") as download:
+            ids = await deliver_media(Bot(), 123, (
+                MediaItem("preview", "https://cdn1.telesco.pe/thumb.jpg"),
+            ))
+        self.assertEqual(ids.message_ids, [])
+        self.assertEqual(ids.unavailable_videos, 1)
+        download.assert_not_called()
+
+    async def test_working_video_is_sent_as_video(self):
+        class Bot:
+            async def send_video(self, **kwargs):
+                self.video = kwargs
+                return SimpleNamespace(message_id=81)
+            async def send_photo(self, **kwargs):
+                raise AssertionError("Actual video must not be sent as a photo")
+        bot = Bot()
+        with patch("media_support.download_media", return_value=b"video bytes"):
+            result = await deliver_media(bot, 123, (
+                MediaItem("video", "https://cdn1.telesco.pe/movie.mp4"),
+            ))
+        self.assertEqual(result.message_ids, [81])
+        self.assertEqual(result.unavailable_videos, 0)
+        self.assertEqual(bot.video["chat_id"], 123)
+
+    async def test_unavailable_video_file_reported(self):
+        class Bot:
+            async def send_video(self, **kwargs):
+                raise AssertionError("Missing video must not be sent")
+        with patch("media_support.download_media", side_effect=ValueError("expired file")):
+            result = await deliver_media(Bot(), 123, (
+                MediaItem("video", "https://cdn1.telesco.pe/expired.mp4"),
+            ))
+        self.assertEqual(result.message_ids, [])
+        self.assertEqual(result.unavailable_videos, 1)
+
+    async def test_video_rejected_by_telegram_reported(self):
+        from telegram.error import BadRequest
+        class Bot:
+            async def send_video(self, **kwargs):
+                raise BadRequest("VIDEO_CONTENT_TYPE_INVALID")
+        with patch("media_support.download_media", return_value=b"movie"):
+            result = await deliver_media(Bot(), 123, (
+                MediaItem("video", "https://cdn1.telesco.pe/movie.mp4"),
+            ))
+        self.assertEqual(result.message_ids, [])
+        self.assertEqual(result.unavailable_videos, 1)
+
+    async def test_large_post_video_budget_reported(self):
+        with patch("media_support.MAX_POST_BYTES", 5), patch(
+            "media_support.download_media", return_value=b"movie-video"
+        ):
+            result = await deliver_media(object(), 123, (
+                MediaItem("video", "https://cdn1.telesco.pe/movie.mp4"),
+            ))
+        self.assertEqual(result.message_ids, [])
+        self.assertEqual(result.unavailable_videos, 1)
 
     async def test_album_is_grouped(self):
         class Bot:
@@ -84,7 +191,8 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 MediaItem("photo", "https://cdn1.telesco.pe/1.jpg"),
                 MediaItem("photo", "https://cdn1.telesco.pe/2.jpg"),
             ))
-        self.assertEqual(ids, [21, 22])
+        self.assertEqual(ids.message_ids, [21, 22])
+        self.assertEqual(ids.unavailable_videos, 0)
         self.assertEqual(len(bot.group["media"]), 2)
 
     async def test_failed_image_does_not_block_others(self):
@@ -100,7 +208,8 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 MediaItem("photo", "https://cdn1.telesco.pe/1.jpg"),
                 MediaItem("photo", "https://cdn1.telesco.pe/2.jpg"),
             ))
-        self.assertEqual(ids, [33])
+        self.assertEqual(ids.message_ids, [33])
+        self.assertEqual(ids.unavailable_videos, 0)
 
 
 if __name__ == "__main__":

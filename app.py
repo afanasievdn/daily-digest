@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
-from media_support import MediaItem, deliver_media, extract_media
+from media_support import MediaItem, deliver_media, extract_media, recover_embedded_videos
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, TimedOut
@@ -426,12 +426,15 @@ async def delete_previous_digest(application: Application) -> None:
     replace_message_ids(OWNER_CHAT_ID, [])
 
 
-def format_post(post: Post) -> str:
+def format_post(post: Post, *, video_unavailable: bool = False) -> str:
     local_time = post.published_at.astimezone(TZ).strftime("%H:%M")
     body = html.escape(post.text)
     if len(body) > 3000:
         body = body[:2997] + "…"
-    return f"<b>{local_time}</b>\n{body}\n<a href=\"{post.url}\">Открыть пост</a>"
+    content = f"<b>{local_time}</b>\n{body}\n<a href=\"{post.url}\">Открыть пост</a>"
+    if video_unavailable:
+        content += "\n<i>🎬 Видео недоступно</i>"
+    return content
 
 
 
@@ -506,23 +509,40 @@ async def run_digest(application: Application, lookback_hours: int | None = None
             sent_ids.append(header.message_id)
 
         for post in posts:
-            message = await send_message_retry(application.bot,
+            media = post.media
+            if media:
+                # Telegram's public channel page may expose only a video thumbnail.
+                media = await asyncio.to_thread(
+                    recover_embedded_videos, post.channel, post.message_id, media
+                )
+            missing_public_video = any(item.kind == "preview" for item in media)
+            message = await send_message_retry(
+                application.bot,
                 OWNER_CHAT_ID,
-                format_post(post),
+                format_post(post, video_unavailable=missing_public_video),
                 parse_mode=ParseMode.HTML,
-                # A Telegram link preview looks like an image but opens the source
-                # channel on mobile. Real media is delivered below as an attachment.
                 disable_web_page_preview=True,
             )
             if message is not None:
                 sent_ids.append(message.message_id)
-                if post.media:
-                    media_ids = await deliver_media(
-                        application.bot, OWNER_CHAT_ID, post.media
-                    )
-                    for media_id in media_ids:
+                if media:
+                    result = await deliver_media(application.bot, OWNER_CHAT_ID, media)
+                    for media_id in result.message_ids:
                         remember_chat_message(OWNER_CHAT_ID, media_id)
-                    sent_ids.extend(media_ids)
+                    sent_ids.extend(result.message_ids)
+                    # A public video file might still fail download or upload.
+                    # Report that without hiding the original post text.
+                    if result.unavailable_videos and not missing_public_video:
+                        try:
+                            await application.bot.edit_message_text(
+                                chat_id=OWNER_CHAT_ID,
+                                message_id=message.message_id,
+                                text=format_post(post, video_unavailable=True),
+                                parse_mode=ParseMode.HTML,
+                                disable_web_page_preview=True,
+                            )
+                        except (BadRequest, NetworkError, TimedOut) as exc:
+                            LOG.warning("Could not add unavailable-video notice: %s", exc)
 
         keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton("🚫 Отписаться", callback_data=f"unsub:{username}")]]

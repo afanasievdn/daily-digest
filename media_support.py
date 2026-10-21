@@ -9,10 +9,11 @@ import logging
 import re
 from dataclasses import dataclass
 from io import BytesIO
+from urllib.parse import quote
 from urllib.parse import urlsplit
 
 import requests
-from bs4 import Tag
+from bs4 import BeautifulSoup, Tag
 from telegram import InputFile, InputMediaPhoto, InputMediaVideo
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 
@@ -31,6 +32,12 @@ USER_AGENT = (
 class MediaItem:
     kind: str  # photo, video, or preview (thumbnail when video is inaccessible)
     url: str
+
+
+@dataclass(frozen=True)
+class DeliveryResult:
+    message_ids: list[int]
+    unavailable_videos: int
 
 
 def _cdn_url(raw: str | None) -> str | None:
@@ -75,16 +82,57 @@ def extract_media(node: Tag) -> tuple[MediaItem, ...]:
             url = _background_url(element)
             kind = "photo"
         else:
-            video = element.select_one("video.tgme_widget_message_video, video[src], video source[src]")
-            url = _cdn_url(video.get("src")) if video else None
+            url = None
+            for video in element.select(
+                "video[src], video[data-src], video source[src], video source[data-src]"
+            ):
+                url = _cdn_url(video.get("src") or video.get("data-src"))
+                if url:
+                    break
             kind = "video"
             if not url:
                 url = _background_url(element.select_one(".tgme_widget_message_video_thumb"))
                 kind = "preview"
-        if url and url not in seen:
+        if kind == "preview" and not url:
+            # A video may lack both a public source and a thumbnail.
+            items.append(MediaItem("preview", ""))
+        elif url and url not in seen:
             items.append(MediaItem(kind, url))
             seen.add(url)
     return tuple(items)
+
+
+def recover_embedded_videos(
+    channel: str, message_id: int, items: tuple[MediaItem, ...]
+) -> tuple[MediaItem, ...]:
+    """Try Telegram's public single-post embed when the feed only exposes a video thumbnail.
+
+    This uses Telegram's public website, not a Telegram user client or account.
+    Original files are not guaranteed to appear in the public embed.
+    """
+    if not any(item.kind == "preview" for item in items):
+        return items
+    try:
+        response = requests.get(
+            f"https://t.me/{quote(channel, safe='')}/{message_id}",
+            params={"embed": "1", "single": "1"},
+            headers={"User-Agent": USER_AGENT},
+            timeout=(10, 20),
+            allow_redirects=False,
+        )
+        if response.status_code != 200:
+            return items
+        response.raise_for_status()
+        embedded = extract_media(BeautifulSoup(response.text, "html.parser"))
+    except (requests.RequestException, ValueError, OSError) as exc:
+        LOG.warning("Could not inspect public video embed: %s", exc)
+        return items
+
+    videos = iter(item for item in embedded if item.kind == "video")
+    return tuple(
+        next(videos, item) if item.kind == "preview" else item
+        for item in items
+    )
 
 
 def download_media(item: MediaItem) -> bytes:
@@ -143,7 +191,7 @@ async def _send_with_retry(callback):
             return None
 
 
-async def deliver_media(bot, chat_id: int, items: tuple[MediaItem, ...]) -> list[int]:
+async def deliver_media(bot, chat_id: int, items: tuple[MediaItem, ...]) -> DeliveryResult:
     """Send actual files, never only auto-generated link previews.
 
     Albums are sent as groups of at most 10. A failed group gets individual
@@ -151,23 +199,36 @@ async def deliver_media(bot, chat_id: int, items: tuple[MediaItem, ...]) -> list
     """
     loaded: list[tuple[MediaItem, bytes]] = []
     used = 0
+    unavailable_videos = 0
     for item in items:
+        # A thumbnail is not playable video; never send it as a fake photo.
+        if item.kind == "preview":
+            unavailable_videos += 1
+            LOG.info("Video not exposed by Telegram public HTML; thumbnail skipped")
+            continue
         if len(loaded) >= 20:
-            LOG.warning("Post has too many attachments; remaining items skipped")
-            break
+            LOG.warning("Post has too many attachments; item skipped")
+            if item.kind == "video":
+                unavailable_videos += 1
+            continue
         try:
             data = await asyncio.to_thread(download_media, item)
             if used + len(data) > MAX_POST_BYTES:
                 LOG.warning("Post media budget exceeded; item skipped")
+                if item.kind == "video":
+                    unavailable_videos += 1
                 continue
             loaded.append((item, data))
             used += len(data)
         except (requests.RequestException, ValueError, OSError) as exc:
             LOG.warning("Could not retrieve %s media: %s", item.kind, exc)
+            if item.kind == "video":
+                unavailable_videos += 1
 
     message_ids: list[int] = []
 
     async def send_one(item: MediaItem, content: bytes) -> None:
+        nonlocal unavailable_videos
         if item.kind == "video":
             async def action():
                 return await bot.send_video(chat_id=chat_id, video=InputFile(content, filename="video.mp4"))
@@ -177,6 +238,8 @@ async def deliver_media(bot, chat_id: int, items: tuple[MediaItem, ...]) -> list
         message = await _send_with_retry(action)
         if message:
             message_ids.append(message.message_id)
+        elif item.kind == "video":
+            unavailable_videos += 1
 
     for start in range(0, len(loaded), 10):
         chunk = loaded[start : start + 10]
@@ -196,4 +259,4 @@ async def deliver_media(bot, chat_id: int, items: tuple[MediaItem, ...]) -> list
         else:
             for item, content in chunk:
                 await send_one(item, content)
-    return message_ids
+    return DeliveryResult(message_ids, unavailable_videos)
