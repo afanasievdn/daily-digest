@@ -31,6 +31,13 @@ class FormatPostTests(TestCase):
         self.assertIn("Видео недоступно", result)
         self.assertIn("https://t.me/world_playstation/55856", result)
 
+    def test_unavailable_photo_notice_keeps_post_and_source(self):
+        post = post_with_media(MediaItem("photo", "https://cdn1.telesco.pe/a.jpg"))
+        result = app.format_post(post, photo_unavailable=True)
+        self.assertIn("Фото недоступно", result)
+        self.assertIn("Example video &amp; information", result)
+        self.assertIn("https://t.me/world_playstation/55856", result)
+
     def test_regular_media_has_no_notice(self):
         self.assertNotIn("Видео недоступно", app.format_post(post_with_media()))
 
@@ -46,6 +53,7 @@ class DigestVideoTests(IsolatedAsyncioTestCase):
         with patch.object(app, "list_channels", return_value=["world_playstation"]), \
              patch.object(app, "scrape_channel", return_value=[post]), \
              patch.object(app, "recover_embedded_videos", side_effect=lambda c, m, items: items), \
+             patch.object(app, "recover_embedded_media", side_effect=lambda c, m, items, **kw: items), \
              patch.object(app, "deliver_media", new_callable=AsyncMock, return_value=delivery) as deliver, \
              patch.object(app, "send_message_retry", send), \
              patch.object(app, "remember_chat_message"), \
@@ -53,6 +61,26 @@ class DigestVideoTests(IsolatedAsyncioTestCase):
              patch.object(app.asyncio, "sleep", new_callable=AsyncMock):
             await app.run_digest(application)
         return send, deliver, bot
+
+    async def test_missing_photo_in_html_has_visible_notice(self):
+        post = app.Post(
+            channel="world_playstation",
+            message_id=55856,
+            published_at=datetime(2026, 10, 20, 18, 0, tzinfo=timezone.utc),
+            text="Image expected",
+            media=(),
+            has_photo=True,
+        )
+        send, deliver, bot = await self._run(post, DeliveryResult([], 0))
+        self.assertIn("Фото недоступно", send.call_args_list[2].args[2])
+        deliver.assert_not_awaited()
+        bot.edit_message_text.assert_not_awaited()
+
+    async def test_failed_photo_upload_adds_notice(self):
+        post = post_with_media(MediaItem("photo", "https://cdn1.telesco.pe/a.jpg"))
+        _, _, bot = await self._run(post, DeliveryResult([], 0, 1))
+        bot.edit_message_text.assert_awaited_once()
+        self.assertIn("Фото недоступно", bot.edit_message_text.await_args.kwargs["text"])
 
     async def test_preview_has_notice_and_no_false_image(self):
         post = post_with_media(MediaItem("preview", "https://cdn1.telesco.pe/thumb.jpg"))
