@@ -498,6 +498,53 @@ async def run_digest(application: Application, lookback_hours: int | None = None
             posts = await asyncio.to_thread(scrape_channel, username, since)
         except Exception as exc:
             LOG.exception("Failed to scrape @%s", username)
+            message = await send_message_retry(application.bot,
+                OWNER_CHAT_ID, f"⚠️ Не удалось прочитать @{username}: {exc}"
+            )
+            if message is not None:
+                sent_ids.append(message.message_id)
+            continue
+
+        header = await send_message_retry(application.bot,
+            OWNER_CHAT_ID,
+            f"<b>Канал @{html.escape(username)}</b> — публикаций: {len(posts)}",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        if header is not None:
+            sent_ids.append(header.message_id)
+
+        # Stop attempting native copies after the first failure in a channel.
+        native_copy_enabled = True
+
+        for post in posts:
+            media = post.media
+            if media:
+                # Telegram's public channel page may expose only a video thumbnail.
+                media = await asyncio.to_thread(
+                    recover_embedded_videos, post.channel, post.message_id, media
+                )
+            # The channel feed may omit an image URL even when the media wrapper exists.
+            missing_photo = post.has_photo and not any(i.kind == "photo" for i in media)
+            missing_video = post.has_video and not any(
+                i.kind in ("video", "preview") for i in media
+            )
+            if missing_photo or missing_video:
+                media = await asyncio.to_thread(
+                    recover_embedded_media,
+                    post.channel,
+                    post.message_id,
+                    media,
+                    look_for_photo=missing_photo,
+                    look_for_video=missing_video,
+                )
+            missing_public_video = (
+                any(item.kind == "preview" for item in media)
+                or (post.has_video and not any(i.kind == "video" for i in media))
+            )
+            missing_public_photo = (
+                post.has_photo and not any(i.kind == "photo" for i in media)
+            )
             message = await send_message_retry(
                 application.bot,
                 OWNER_CHAT_ID,
@@ -508,12 +555,15 @@ async def run_digest(application: Application, lookback_hours: int | None = None
             if message is not None:
                 sent_ids.append(message.message_id)
 
-                # Native Telegram copy preserves playable videos and original
-                # photos even when public CDN URLs are expired or inaccessible.
-                # A single copy is not a full album, so keep albums on the
-                # multi-attachment delivery path.
+                # A native copy can preserve the original photo or playable
+                # video when the public HTML has only an expired URL/thumbnail.
+                # For albums the CDN path can still send every attachment.
                 copied_id = None
-                if native_copy_enabled and (post.has_photo or post.has_video or media) and len(media) <= 1:
+                if (
+                    native_copy_enabled
+                    and (post.has_photo or post.has_video or media)
+                    and len(media) <= 1
+                ):
                     copied_id = await copy_public_media(
                         application.bot, OWNER_CHAT_ID, post.channel, post.message_id
                     )
@@ -536,8 +586,8 @@ async def run_digest(application: Application, lookback_hours: int | None = None
                     unavailable_video = unavailable_video or bool(result.unavailable_videos)
                     unavailable_photo = unavailable_photo or bool(result.unavailable_photos)
 
-                # Announce missing attachments only after both copy and CDN
-                # delivery have had a chance to succeed.
+                # Only mark attachments unavailable after both delivery methods
+                # have been tried; don't display a misleading photo/video notice.
                 if unavailable_video or unavailable_photo:
                     try:
                         await application.bot.edit_message_text(
