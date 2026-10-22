@@ -254,6 +254,29 @@ async def _send_with_retry(callback):
             return None
 
 
+async def copy_public_media(bot, chat_id: int, channel: str, message_id: int) -> int | None:
+    """Try copying Telegram's original attachment without downloading CDN URLs.
+
+    Public channel access is not guaranteed for bots. Fail quietly and let the
+    caller use the HTML/CDN fallback; never treat a failed copy as success.
+    """
+    from telegram.error import Forbidden
+
+    try:
+        result = await _send_with_retry(
+            lambda: bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=f"@{channel}",
+                message_id=message_id,
+                caption="",  # Text/link already appear in the digest message.
+            )
+        )
+    except Forbidden as exc:
+        LOG.info("Telegram channel copy not permitted for @%s: %s", channel, exc)
+        return None
+    return result.message_id if result is not None else None
+
+
 async def deliver_media(bot, chat_id: int, items: tuple[MediaItem, ...]) -> DeliveryResult:
     """Send actual files, never only auto-generated link previews.
 
