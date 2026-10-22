@@ -76,14 +76,12 @@ def _photo_url(element: Tag) -> str | None:
     """Read the ordinary background image or a direct image inside the photo wrapper."""
     for candidate in (element, *element.select("img")):
         url = _background_url(candidate)
-        if not url:
-            url = _cdn_url(
-                candidate.get("src")
-                or candidate.get("data-src")
-                or candidate.get("data-original")
-            )
         if url:
             return url
+        for attribute in ("src", "data-src", "data-original"):
+            url = _cdn_url(candidate.get(attribute))
+            if url:
+                return url
     return None
 
 
