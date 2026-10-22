@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
-from media_support import (MediaItem, deliver_media, extract_media, recover_embedded_media, recover_embedded_videos)
+from media_support import (MediaItem, copy_public_media, deliver_media, extract_media, recover_embedded_media, recover_embedded_videos)
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, TimedOut
@@ -498,84 +498,61 @@ async def run_digest(application: Application, lookback_hours: int | None = None
             posts = await asyncio.to_thread(scrape_channel, username, since)
         except Exception as exc:
             LOG.exception("Failed to scrape @%s", username)
-            message = await send_message_retry(application.bot,
-                OWNER_CHAT_ID, f"⚠️ Не удалось прочитать @{username}: {exc}"
-            )
-            if message is not None:
-                sent_ids.append(message.message_id)
-            continue
-
-        header = await send_message_retry(application.bot,
-            OWNER_CHAT_ID,
-            f"<b>Канал @{html.escape(username)}</b> — публикаций: {len(posts)}",
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        if header is not None:
-            sent_ids.append(header.message_id)
-
-        for post in posts:
-            media = post.media
-            if media:
-                # Telegram's public channel page may expose only a video thumbnail.
-                media = await asyncio.to_thread(
-                    recover_embedded_videos, post.channel, post.message_id, media
-                )
-            # The channel feed may omit an image URL even when the media wrapper exists.
-            missing_photo = post.has_photo and not any(i.kind == "photo" for i in media)
-            missing_video = post.has_video and not any(
-                i.kind in ("video", "preview") for i in media
-            )
-            if missing_photo or missing_video:
-                media = await asyncio.to_thread(
-                    recover_embedded_media,
-                    post.channel,
-                    post.message_id,
-                    media,
-                    look_for_photo=missing_photo,
-                    look_for_video=missing_video,
-                )
-            missing_public_video = (
-                any(item.kind == "preview" for item in media)
-                or (post.has_video and not any(i.kind == "video" for i in media))
-            )
-            missing_public_photo = (
-                post.has_photo and not any(i.kind == "photo" for i in media)
-            )
             message = await send_message_retry(
                 application.bot,
                 OWNER_CHAT_ID,
-                format_post(post, video_unavailable=missing_public_video, photo_unavailable=missing_public_photo),
+                format_post(post),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
             if message is not None:
                 sent_ids.append(message.message_id)
-                if media:
+
+                # Native Telegram copy preserves playable videos and original
+                # photos even when public CDN URLs are expired or inaccessible.
+                # A single copy is not a full album, so keep albums on the
+                # multi-attachment delivery path.
+                copied_id = None
+                if native_copy_enabled and (post.has_photo or post.has_video or media) and len(media) <= 1:
+                    copied_id = await copy_public_media(
+                        application.bot, OWNER_CHAT_ID, post.channel, post.message_id
+                    )
+                    if copied_id is None:
+                        native_copy_enabled = False
+                    else:
+                        sent_ids.append(copied_id)
+                        remember_chat_message(OWNER_CHAT_ID, copied_id)
+
+                unavailable_video = missing_public_video
+                unavailable_photo = missing_public_photo
+                if copied_id is not None:
+                    unavailable_video = False
+                    unavailable_photo = False
+                elif media:
                     result = await deliver_media(application.bot, OWNER_CHAT_ID, media)
                     for media_id in result.message_ids:
                         remember_chat_message(OWNER_CHAT_ID, media_id)
                     sent_ids.extend(result.message_ids)
-                    # A photo or video can be extracted but rejected during delivery.
-                    # Mark missing attachments instead of silently showing text only.
-                    if (
-                        (result.unavailable_videos and not missing_public_video)
-                        or (result.unavailable_photos and not missing_public_photo)
-                    ):
-                        try:
-                            await application.bot.edit_message_text(
-                                chat_id=OWNER_CHAT_ID,
-                                message_id=message.message_id,
-                                text=format_post(
-                                    post,
-                                    video_unavailable=bool(result.unavailable_videos) or missing_public_video,
-                                    photo_unavailable=bool(result.unavailable_photos) or missing_public_photo,
-                                ),
-                                parse_mode=ParseMode.HTML,
-                                disable_web_page_preview=True,
-                            )
-                        except (BadRequest, NetworkError, TimedOut) as exc:
-                            LOG.warning("Could not add unavailable-media notice: %s", exc)
+                    unavailable_video = unavailable_video or bool(result.unavailable_videos)
+                    unavailable_photo = unavailable_photo or bool(result.unavailable_photos)
+
+                # Announce missing attachments only after both copy and CDN
+                # delivery have had a chance to succeed.
+                if unavailable_video or unavailable_photo:
+                    try:
+                        await application.bot.edit_message_text(
+                            chat_id=OWNER_CHAT_ID,
+                            message_id=message.message_id,
+                            text=format_post(
+                                post,
+                                video_unavailable=unavailable_video,
+                                photo_unavailable=unavailable_photo,
+                            ),
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+                    except (BadRequest, NetworkError, TimedOut) as exc:
+                        LOG.warning("Could not add unavailable-media notice: %s", exc)
 
         keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton("🚫 Отписаться", callback_data=f"unsub:{username}")]]
