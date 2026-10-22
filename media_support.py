@@ -38,6 +38,7 @@ class MediaItem:
 class DeliveryResult:
     message_ids: list[int]
     unavailable_videos: int
+    unavailable_photos: int = 0
 
 
 def _cdn_url(raw: str | None) -> str | None:
@@ -71,6 +72,21 @@ def _background_url(element: Tag | None) -> str | None:
     return _cdn_url(match.group(1)) if match else None
 
 
+def _photo_url(element: Tag) -> str | None:
+    """Read the ordinary background image or a direct image inside the photo wrapper."""
+    for candidate in (element, *element.select("img")):
+        url = _background_url(candidate)
+        if not url:
+            url = _cdn_url(
+                candidate.get("src")
+                or candidate.get("data-src")
+                or candidate.get("data-original")
+            )
+        if url:
+            return url
+    return None
+
+
 def extract_media(node: Tag) -> tuple[MediaItem, ...]:
     """Parse only post attachments, excluding author avatars and link previews."""
     items: list[MediaItem] = []
@@ -79,7 +95,7 @@ def extract_media(node: Tag) -> tuple[MediaItem, ...]:
     for element in node.select(selectors):
         classes = element.get("class", [])
         if "tgme_widget_message_photo_wrap" in classes:
-            url = _background_url(element)
+            url = _photo_url(element)
             kind = "photo"
         else:
             url = None
@@ -133,6 +149,55 @@ def recover_embedded_videos(
         next(videos, item) if item.kind == "preview" else item
         for item in items
     )
+
+
+def recover_embedded_media(
+    channel: str,
+    message_id: int,
+    items: tuple[MediaItem, ...],
+    *,
+    look_for_photo: bool = False,
+    look_for_video: bool = False,
+) -> tuple[MediaItem, ...]:
+    """Check the single-post public embed when the channel feed lost attachments.
+
+    An absent image in the public page is not evidence that the original
+    Telegram post had no image; keep this check separate from Bot API access.
+    """
+    missing_photo = look_for_photo and not any(i.kind == "photo" for i in items)
+    missing_video = look_for_video and not any(
+        i.kind in ("video", "preview") for i in items
+    )
+    if not (missing_photo or missing_video):
+        return items
+    try:
+        response = requests.get(
+            f"https://t.me/{quote(channel, safe='')}/{message_id}",
+            params={"embed": "1", "single": "1"},
+            headers={"User-Agent": USER_AGENT},
+            timeout=(10, 20),
+            allow_redirects=False,
+        )
+        if response.status_code != 200:
+            return items
+        response.raise_for_status()
+        embedded = extract_media(BeautifulSoup(response.text, "html.parser"))
+    except (requests.RequestException, ValueError, OSError) as exc:
+        LOG.warning("Could not recover public post attachments: %s", exc)
+        return items
+
+    extra = [
+        item for item in embedded
+        if (missing_photo and item.kind == "photo")
+        or (missing_video and item.kind in ("video", "preview"))
+    ]
+    seen = {(item.kind, item.url) for item in items}
+    merged = list(items)
+    for item in extra:
+        if (item.kind, item.url) not in seen:
+            merged.append(item)
+            seen.add((item.kind, item.url))
+    return tuple(merged)
 
 
 def download_media(item: MediaItem) -> bytes:
@@ -200,6 +265,7 @@ async def deliver_media(bot, chat_id: int, items: tuple[MediaItem, ...]) -> Deli
     loaded: list[tuple[MediaItem, bytes]] = []
     used = 0
     unavailable_videos = 0
+    unavailable_photos = 0
     for item in items:
         # A thumbnail is not playable video; never send it as a fake photo.
         if item.kind == "preview":
@@ -210,6 +276,8 @@ async def deliver_media(bot, chat_id: int, items: tuple[MediaItem, ...]) -> Deli
             LOG.warning("Post has too many attachments; item skipped")
             if item.kind == "video":
                 unavailable_videos += 1
+            elif item.kind == "photo":
+                unavailable_photos += 1
             continue
         try:
             data = await asyncio.to_thread(download_media, item)
@@ -217,6 +285,8 @@ async def deliver_media(bot, chat_id: int, items: tuple[MediaItem, ...]) -> Deli
                 LOG.warning("Post media budget exceeded; item skipped")
                 if item.kind == "video":
                     unavailable_videos += 1
+                elif item.kind == "photo":
+                    unavailable_photos += 1
                 continue
             loaded.append((item, data))
             used += len(data)
@@ -224,11 +294,13 @@ async def deliver_media(bot, chat_id: int, items: tuple[MediaItem, ...]) -> Deli
             LOG.warning("Could not retrieve %s media: %s", item.kind, exc)
             if item.kind == "video":
                 unavailable_videos += 1
+            elif item.kind == "photo":
+                unavailable_photos += 1
 
     message_ids: list[int] = []
 
     async def send_one(item: MediaItem, content: bytes) -> None:
-        nonlocal unavailable_videos
+        nonlocal unavailable_videos, unavailable_photos
         if item.kind == "video":
             async def action():
                 return await bot.send_video(chat_id=chat_id, video=InputFile(content, filename="video.mp4"))
@@ -240,6 +312,8 @@ async def deliver_media(bot, chat_id: int, items: tuple[MediaItem, ...]) -> Deli
             message_ids.append(message.message_id)
         elif item.kind == "video":
             unavailable_videos += 1
+        else:
+            unavailable_photos += 1
 
     for start in range(0, len(loaded), 10):
         chunk = loaded[start : start + 10]
@@ -259,4 +333,4 @@ async def deliver_media(bot, chat_id: int, items: tuple[MediaItem, ...]) -> Deli
         else:
             for item, content in chunk:
                 await send_one(item, content)
-    return DeliveryResult(message_ids, unavailable_videos)
+    return DeliveryResult(message_ids, unavailable_videos, unavailable_photos)
