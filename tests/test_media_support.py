@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from bs4 import BeautifulSoup
 
-from media_support import MediaItem, _cdn_url, deliver_media, extract_media, recover_embedded_videos
+from media_support import MediaItem, _cdn_url, deliver_media, extract_media, recover_embedded_media, recover_embedded_videos
 
 
 def read_media(markup):
@@ -23,6 +23,16 @@ class HtmlMediaTests(unittest.TestCase):
              style="background-image:url('https://cdn2.telesco.pe/file/photo.jpg')"></a>
           <img class="link_preview" src="https://cdn2.telesco.pe/preview.jpg">''')
         self.assertEqual(items, (MediaItem("photo", "https://cdn2.telesco.pe/file/photo.jpg"),))
+
+    def test_photo_nested_img_fallback(self):
+        items = read_media("""
+            <a class="tgme_widget_message_photo_wrap">
+                <img src="https://cdn2.telesco.pe/real.jpg">
+            </a>
+        """)
+        self.assertEqual(
+            items, (MediaItem("photo", "https://cdn2.telesco.pe/real.jpg"),)
+        )
 
     def test_photo_album_and_deduplication(self):
         markup = "".join(
@@ -75,6 +85,32 @@ class HtmlMediaTests(unittest.TestCase):
         })
         self.assertFalse(request.call_args.kwargs["allow_redirects"])
 
+    def test_missing_photo_recovered_from_public_embed(self):
+        response = SimpleNamespace(
+            status_code=200,
+            text="""<a class="tgme_widget_message_photo_wrap"
+                style="background-image:url('https://cdn1.telesco.pe/restored.jpg')"></a>""",
+            raise_for_status=lambda: None,
+        )
+        with patch("media_support.requests.get", return_value=response):
+            recovered = recover_embedded_media(
+                "public_channel", 123, (), look_for_photo=True
+            )
+        self.assertEqual(
+            recovered, (MediaItem("photo", "https://cdn1.telesco.pe/restored.jpg"),)
+        )
+
+    def test_missing_photo_stays_empty_without_public_file(self):
+        response = SimpleNamespace(
+            status_code=200, text="<div>Missing image</div>",
+            raise_for_status=lambda: None,
+        )
+        with patch("media_support.requests.get", return_value=response):
+            recovered = recover_embedded_media(
+                "public_channel", 123, (), look_for_photo=True
+            )
+        self.assertEqual(recovered, ())
+
     def test_no_video_in_public_embed_keeps_marker(self):
         response = SimpleNamespace(
             status_code=200,
@@ -118,6 +154,14 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ids.message_ids, [11])
         self.assertEqual(ids.unavailable_videos, 0)
         self.assertEqual(bot.photo["chat_id"], 123)
+
+    async def test_failed_photo_download_is_reported(self):
+        with patch("media_support.download_media", side_effect=ValueError("expired")):
+            result = await deliver_media(object(), 123, (
+                MediaItem("photo", "https://cdn1.telesco.pe/expired.jpg"),
+            ))
+        self.assertEqual(result.message_ids, [])
+        self.assertEqual(result.unavailable_photos, 1)
 
     async def test_video_thumbnail_never_sent_as_photo(self):
         class Bot:
